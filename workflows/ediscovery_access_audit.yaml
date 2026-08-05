@@ -1,0 +1,103 @@
+id: 5cb40580-1cad-4883-a60e-0f40df66d0ab
+name: "@dougschaefer/ediscovery-access-audit"
+description: >-
+  Answer "what can this person actually do in eDiscovery?" across both layers
+  that decide it, for any set of principals. Entra directory roles alone are
+  not the answer: Global Administrator maps to the Purview OrganizationManagement
+  role group, which carries Case Management, Compliance Search, Hold and Search
+  And Purge but NOT Export, Preview, Review, RMS Decrypt or Custodian —
+  Compliance Administrator is missing the same four, and only the
+  eDiscoveryManager role group holds them. A tenant admin can therefore open a
+  case and run a search yet be unable to export a single item, and an
+  Entra-only review will wrongly report them as fully capable. This workflow
+  captures directory roles (direct and group-inherited) from `entra-users`,
+  then the Purview role groups, per-principal capability, and the eDiscovery
+  Administrator list from `purview-rbac`, so search capability and evidence-egress
+  capability are recorded separately. Read-only — changes nothing. The three
+  Purview steps run sequentially because they share one model's lock.
+tags: {}
+inputs:
+  properties:
+    principals:
+      type: array
+      description: >-
+        UPNs to audit, e.g. ["alice@contoso.com","adm-alice@contoso.com"].
+        Object ids and display names are also accepted. A principal that cannot
+        be resolved to a directory object fails the run rather than being
+        reported as having no access.
+      items:
+        type: string
+  required:
+    - principals
+jobs:
+  - name: audit
+    description: >-
+      Capture the Entra and Purview halves of eDiscovery capability for the
+      supplied principals.
+    steps:
+      - name: entra-directory-roles
+        description: >-
+          Resolve effective directory roles for each principal — direct
+          assignments plus any inherited through a role-assignable group, which
+          a principalId-filtered roleAssignments query never returns.
+        task:
+          type: model_method
+          modelIdOrName: entra-users
+          methodName: auditDirectoryRoles
+          inputs:
+            ids: "${{ inputs.principals }}"
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: purview-role-groups
+        description: >-
+          Snapshot every Purview role group with its management roles and
+          membership, flagging which grant eDiscovery capability and which
+          grant evidence egress.
+        task:
+          type: model_method
+          modelIdOrName: purview-rbac
+          methodName: syncRoleGroups
+          inputs: {}
+        dependsOn:
+          - step: entra-directory-roles
+            condition:
+              type: succeeded
+        weight: 0
+        allowFailure: false
+      - name: purview-principal-access
+        description: >-
+          Per principal, resolve role-group membership to effective management
+          roles and record canSearch separately from canExport.
+        task:
+          type: model_method
+          modelIdOrName: purview-rbac
+          methodName: auditPrincipals
+          inputs:
+            principals: "${{ inputs.principals }}"
+        dependsOn:
+          - step: purview-role-groups
+            condition:
+              type: succeeded
+        weight: 0
+        allowFailure: false
+      - name: ediscovery-case-admins
+        description: >-
+          List eDiscovery Administrators — the tier that can open every case in
+          the tenant, including cases they were never assigned to. Captured for
+          the whole tenant, not just the audited principals, because this is the
+          membership most often granted once and never reviewed.
+        task:
+          type: model_method
+          modelIdOrName: purview-rbac
+          methodName: listCaseAdmins
+          inputs: {}
+        dependsOn:
+          - step: purview-principal-access
+            condition:
+              type: succeeded
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1
