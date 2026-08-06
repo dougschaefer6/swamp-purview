@@ -57,7 +57,7 @@ const CaseAdminSchema = z
  */
 export const model = {
   type: "@dougschaefer/purview-rbac",
-  version: "2026.08.05.1",
+  version: "2026.08.05.2",
   globalArguments: PurviewGlobalArgsSchema,
   resources: {
     roleGroup: {
@@ -217,10 +217,19 @@ export const model = {
           // the caller's UPN against role-group membership directly would
           // never hit, because the compliance session populates only Name.
           const resolved = await resolvePrincipal(principal);
-          const needle = resolved.displayName.toLowerCase();
+          // Graph and Purview do not always spell a display name the same way:
+          // a shared mailbox comes back from Graph as "Alice Example (Shared)"
+          // while the role group stores plain "Alice Example". An exact match
+          // therefore reports no access for an account that holds export
+          // rights — the same false negative as the UPN case, via a different
+          // spelling. Normalize the qualifier suffix off both sides.
+          const norm = (s: string) =>
+            s.toLowerCase().replace(/\s*\((shared|archive|group)\)\s*$/i, "")
+              .trim();
+          const needle = norm(resolved.displayName);
 
           const memberOf = groups.filter((g) =>
-            (g.members ?? []).some((m) => String(m).toLowerCase() === needle)
+            (g.members ?? []).some((m) => norm(String(m)) === needle)
           );
 
           const effectiveRoles = [
@@ -235,10 +244,7 @@ export const model = {
           const canSearch = effectiveRoles.includes("Compliance Search") ||
             effectiveRoles.includes("Case Management");
           // Case-admin entries carry a "(Shared)" suffix for shared mailboxes.
-          const isCaseAdmin = caseAdmins.some((a) =>
-            a === needle ||
-            a.replace(/\s*\(shared\)\s*$/i, "").trim() === needle
-          );
+          const isCaseAdmin = caseAdmins.some((a) => norm(a) === needle);
 
           context.logger.info(
             "{principal}: search={search} export={export} caseAdmin={admin} via {groups} role group(s)",
@@ -270,6 +276,138 @@ export const model = {
           );
         }
         return { dataHandles: handles };
+      },
+    },
+
+    listCases: {
+      description:
+        "List eDiscovery (compliance) cases with their status, so a search or hold can be attached to the exact case name Purview holds rather than a paraphrase of it.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const raw = (await pwshJson(
+          context.globalArgs,
+          emitJson(`Get-ComplianceCase | Select-Object Name, Status, Identity`),
+        )) as Array<{ Name?: string; Status?: string }>;
+        for (const c of raw ?? []) {
+          context.logger.info("case: {name} [{status}]", {
+            name: c.Name,
+            status: c.Status,
+          });
+        }
+        return { dataHandles: [] };
+      },
+    },
+
+    placeCustodianHold: {
+      description:
+        "Place a preservation hold on custodian mailboxes within an eDiscovery case (New-CaseHoldPolicy + New-CaseHoldRule). Deliberately preserves the FULL mailbox with no content query by default: a query-scoped hold only preserves what the query happened to match, so any later refinement of the search terms cannot recover what was deleted in the meantime. Holds are preservative and reversible; they never delete. In eDiscovery Standard placing a hold does NOT notify the custodian.",
+      arguments: z.object({
+        caseName: z
+          .string()
+          .describe("Exact eDiscovery case name as Purview stores it"),
+        holdName: z.string().describe("Name for the hold policy"),
+        mailboxes: z
+          .array(z.string())
+          .min(1)
+          .describe("Custodian mailbox UPNs to preserve"),
+        contentQuery: z
+          .string()
+          .optional()
+          .describe(
+            "Optional KQL to scope the hold. Omit for a full-mailbox hold, which is the defensible default.",
+          ),
+      }),
+      execute: async (args, context) => {
+        await pwshJson(
+          context.globalArgs,
+          emitJson(
+            `$mb = @($P.mailboxes)
+  $policy = New-CaseHoldPolicy -Name $P.holdName -Case $P.caseName -ExchangeLocation $mb -Force -ErrorAction Stop
+  if ($P.contentQuery) {
+    New-CaseHoldRule -Name ($P.holdName + "-rule") -Policy $policy.Name -ContentMatchQuery $P.contentQuery -ErrorAction Stop | Out-Null
+  } else {
+    New-CaseHoldRule -Name ($P.holdName + "-rule") -Policy $policy.Name -ErrorAction Stop | Out-Null
+  }
+  Get-CaseHoldPolicy -Identity $policy.Name -Case $P.caseName |
+    Select-Object Name, Enabled, ExchangeLocation, DistributionStatus`,
+          ),
+          {
+            caseName: args.caseName,
+            holdName: args.holdName,
+            mailboxes: args.mailboxes,
+            contentQuery: args.contentQuery ?? "",
+          },
+        );
+        context.logger.info(
+          "Hold {hold} placed on {count} mailbox(es) in case {case}",
+          {
+            hold: args.holdName,
+            count: args.mailboxes.length,
+            case: args.caseName,
+          },
+        );
+        return { dataHandles: [] };
+      },
+    },
+
+    runComplianceSearch: {
+      description:
+        "Create a content search inside an eDiscovery case, start it, and poll until it completes, returning hit counts and size. Read-only against custodian data — it reports what matches and never previews, exports, or alters content. Dates in KQL are evaluated in UTC, so pass boundaries already offset if the intended window is local.",
+      arguments: z.object({
+        caseName: z
+          .string()
+          .describe("Exact eDiscovery case name as Purview stores it"),
+        searchName: z.string().describe("Name for this search"),
+        mailboxes: z
+          .array(z.string())
+          .min(1)
+          .describe("Mailbox UPNs to search"),
+        contentQuery: z.string().describe("KQL content query"),
+      }),
+      execute: async (args, context) => {
+        const raw = await pwshJson(
+          context.globalArgs,
+          emitJson(
+            `$mb = @($P.mailboxes)
+  # Idempotent: a prior attempt can leave the search created but unstarted,
+  # because New-ComplianceSearch succeeds in an ordinary compliance session
+  # while Start-ComplianceSearch requires -EnableSearchOnlySession.
+  $existing = $null
+  try { $existing = Get-ComplianceSearch -Identity $P.searchName -ErrorAction Stop } catch {}
+  if (-not $existing) {
+    New-ComplianceSearch -Name $P.searchName -Case $P.caseName -ExchangeLocation $mb -ContentMatchQuery $P.contentQuery -ErrorAction Stop | Out-Null
+  }
+  Start-ComplianceSearch -Identity $P.searchName -ErrorAction Stop | Out-Null
+  $deadline = (Get-Date).AddMinutes(25)
+  do {
+    Start-Sleep -Seconds 15
+    $s = Get-ComplianceSearch -Identity $P.searchName
+  } while ($s.Status -ne 'Completed' -and (Get-Date) -lt $deadline)
+  $s | Select-Object Name, Status, Items, Size, ContentMatchQuery, Errors`,
+          ),
+          {
+            caseName: args.caseName,
+            searchName: args.searchName,
+            mailboxes: args.mailboxes,
+            contentQuery: args.contentQuery,
+          },
+          true,
+        );
+        const r = (Array.isArray(raw) ? raw[0] : raw) as {
+          Status?: string;
+          Items?: number;
+          Size?: number;
+        };
+        context.logger.info(
+          "Search {name}: status={status} items={items} size={size}",
+          {
+            name: args.searchName,
+            status: r?.Status,
+            items: r?.Items,
+            size: r?.Size,
+          },
+        );
+        return { dataHandles: [] };
       },
     },
 

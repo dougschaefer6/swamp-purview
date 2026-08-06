@@ -51,7 +51,29 @@ const END = "<<<SWAMP_JSON_END>>>";
  * interactive branch exists so the same model works at a workstation before an
  * app registration is in place.
  */
-function connectBlock(g: PurviewGlobalArgs): string {
+function connectBlock(g: PurviewGlobalArgs, searchOnly = false): string {
+  // Compliance SEARCH execution requires a different session type than
+  // everything else. Start-ComplianceSearch refuses to run in an ordinary
+  // compliance session with "Please close the current PowerShell session and
+  // open a new session using Connect-IPPSSession with the
+  // -EnableSearchOnlySession flag" — that flag exists only on
+  // Connect-IPPSSession, not Connect-ExchangeOnline. Role-group reads and hold
+  // management, conversely, are NOT available in a search-only session, so the
+  // two modes cannot be collapsed into one.
+  if (searchOnly) {
+    const upnS = g.userPrincipalName
+      ? `-UserPrincipalName $env:SWAMP_PV_UPN `
+      : "";
+    if (g.appId && g.certificateThumbprint) {
+      return `Connect-IPPSSession -AppId $env:SWAMP_PV_APPID ` +
+        `-CertificateThumbprint $env:SWAMP_PV_THUMB ` +
+        `-Organization $env:SWAMP_PV_ORG -EnableSearchOnlySession ` +
+        `-ShowBanner:$false -ErrorAction Stop`;
+    }
+    return `Connect-IPPSSession ${upnS}-Organization $env:SWAMP_PV_ORG ` +
+      `-EnableSearchOnlySession -ShowBanner:$false -ErrorAction Stop`;
+  }
+
   const common =
     `-ConnectionUri "https://ps.compliance.protection.outlook.com/powershell-liveid/" ` +
     `-AzureADAuthorizationEndpointUri "https://login.microsoftonline.com/organizations" ` +
@@ -82,6 +104,7 @@ export async function pwshJson(
   g: PurviewGlobalArgs,
   body: string,
   params: Record<string, unknown> = {},
+  searchOnly = false,
 ): Promise<unknown> {
   const dir = await Deno.makeTempDir({ prefix: "swamp-purview-" });
   const scriptPath = `${dir}/run.ps1`;
@@ -95,7 +118,7 @@ export async function pwshJson(
 $ErrorActionPreference = 'Stop'
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
 $P = Get-Content -Raw -Path $env:SWAMP_PV_PARAMS | ConvertFrom-Json
-${connectBlock(g)}
+${connectBlock(g, searchOnly)}
 try {
 ${body}
 } finally {
