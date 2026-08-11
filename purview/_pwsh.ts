@@ -47,11 +47,32 @@ const BEGIN = "<<<SWAMP_JSON_BEGIN>>>";
 const END = "<<<SWAMP_JSON_END>>>";
 
 /**
+ * Which of the three mutually exclusive PowerShell endpoints a body needs.
+ *
+ * These are genuinely three separate services that happen to share a module,
+ * and a cmdlet available in one is absent from the others:
+ *
+ * - `compliance` — role groups, cases, hold policies. Connect-ExchangeOnline
+ *   pointed at ps.compliance.protection.outlook.com.
+ * - `searchOnly` — Start-ComplianceSearch and nothing else, via
+ *   Connect-IPPSSession -EnableSearchOnlySession.
+ * - `exchange` — the real Exchange Online endpoint. Required for
+ *   Search-UnifiedAuditLog, Get-Mailbox and Get-MailboxFolderStatistics, none
+ *   of which exist in a compliance session. Omitting -ConnectionUri is what
+ *   distinguishes it: passing the compliance URI silently yields a session in
+ *   which Search-UnifiedAuditLog is simply not a recognised command.
+ */
+export type PurviewSession = "compliance" | "searchOnly" | "exchange";
+
+/**
  * Build the Connect-* preamble. Certificate app-only auth is preferred; the
  * interactive branch exists so the same model works at a workstation before an
  * app registration is in place.
  */
-function connectBlock(g: PurviewGlobalArgs, searchOnly = false): string {
+function connectBlock(
+  g: PurviewGlobalArgs,
+  mode: PurviewSession = "compliance",
+): string {
   // Compliance SEARCH execution requires a different session type than
   // everything else. Start-ComplianceSearch refuses to run in an ordinary
   // compliance session with "Please close the current PowerShell session and
@@ -60,7 +81,7 @@ function connectBlock(g: PurviewGlobalArgs, searchOnly = false): string {
   // Connect-IPPSSession, not Connect-ExchangeOnline. Role-group reads and hold
   // management, conversely, are NOT available in a search-only session, so the
   // two modes cannot be collapsed into one.
-  if (searchOnly) {
+  if (mode === "searchOnly") {
     const upnS = g.userPrincipalName
       ? `-UserPrincipalName $env:SWAMP_PV_UPN `
       : "";
@@ -74,10 +95,13 @@ function connectBlock(g: PurviewGlobalArgs, searchOnly = false): string {
       `-EnableSearchOnlySession -ShowBanner:$false -ErrorAction Stop`;
   }
 
-  const common =
-    `-ConnectionUri "https://ps.compliance.protection.outlook.com/powershell-liveid/" ` +
-    `-AzureADAuthorizationEndpointUri "https://login.microsoftonline.com/organizations" ` +
-    `-ShowBanner:$false -ErrorAction Stop`;
+  // The exchange mode deliberately omits -ConnectionUri so the module resolves
+  // its own Exchange Online endpoint.
+  const common = mode === "exchange"
+    ? `-ShowBanner:$false -ErrorAction Stop`
+    : `-ConnectionUri "https://ps.compliance.protection.outlook.com/powershell-liveid/" ` +
+      `-AzureADAuthorizationEndpointUri "https://login.microsoftonline.com/organizations" ` +
+      `-ShowBanner:$false -ErrorAction Stop`;
 
   if (g.appId && g.certificateThumbprint) {
     return `Connect-ExchangeOnline -AppId $env:SWAMP_PV_APPID ` +
@@ -104,7 +128,7 @@ export async function pwshJson(
   g: PurviewGlobalArgs,
   body: string,
   params: Record<string, unknown> = {},
-  searchOnly = false,
+  mode: PurviewSession = "compliance",
 ): Promise<unknown> {
   const dir = await Deno.makeTempDir({ prefix: "swamp-purview-" });
   const scriptPath = `${dir}/run.ps1`;
@@ -118,7 +142,7 @@ export async function pwshJson(
 $ErrorActionPreference = 'Stop'
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
 $P = Get-Content -Raw -Path $env:SWAMP_PV_PARAMS | ConvertFrom-Json
-${connectBlock(g, searchOnly)}
+${connectBlock(g, mode)}
 try {
 ${body}
 } finally {

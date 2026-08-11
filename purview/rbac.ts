@@ -57,7 +57,7 @@ const CaseAdminSchema = z
  */
 export const model = {
   type: "@dougschaefer/purview-rbac",
-  version: "2026.08.05.2",
+  version: "2026.08.11.1",
   globalArguments: PurviewGlobalArgsSchema,
   resources: {
     roleGroup: {
@@ -391,7 +391,7 @@ export const model = {
             mailboxes: args.mailboxes,
             contentQuery: args.contentQuery,
           },
-          true,
+          "searchOnly",
         );
         const r = (Array.isArray(raw) ? raw[0] : raw) as {
           Status?: string;
