@@ -2,8 +2,10 @@ import { z } from "npm:zod@4.3.6";
 import {
   emitJson,
   PurviewGlobalArgsSchema,
+  PurviewMethodContext,
   pwshJson,
   sanitizeInstanceName,
+  warnIfAppOnlyEdiscovery,
 } from "./_pwsh.ts";
 
 const AffectedItemSchema = z
@@ -135,8 +137,16 @@ interface RawRecord {
  */
 export const model = {
   type: "@dougschaefer/purview-audit",
-  version: "2026.08.11.1",
+  version: "2026.10.07.1",
   globalArguments: PurviewGlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.07.1",
+      description:
+        "previewSearch warns that app-only auth is best-effort for eDiscovery cmdlets; globalArguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     deletionProfile: {
       description:
@@ -191,7 +201,16 @@ export const model = {
           .default(["ExchangeItem", "ExchangeItemGroup", "MicrosoftTeams"])
           .describe("Audit record types to sweep"),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: {
+          principals: string[];
+          startDate: string;
+          endDate: string;
+          chunkDays: number;
+          recordTypes: string[];
+        },
+        context: PurviewMethodContext,
+      ) => {
         const raw = (await pwshJson(
           context.globalArgs,
           emitJson(
@@ -403,7 +422,15 @@ export const model = {
           .default(20)
           .describe("How long to poll for the preview action to complete"),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: { searchName: string; timeoutMinutes: number },
+        context: PurviewMethodContext,
+      ) => {
+        warnIfAppOnlyEdiscovery(
+          context.globalArgs,
+          context.logger,
+          "New-ComplianceSearchAction -Preview",
+        );
         const raw = await pwshJson(
           context.globalArgs,
           emitJson(

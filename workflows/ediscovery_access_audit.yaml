@@ -14,7 +14,13 @@ description: >-
   then the Purview role groups, per-principal capability, and the eDiscovery
   Administrator list from `purview-rbac`, so search capability and evidence-egress
   capability are recorded separately. Read-only — changes nothing. The three
-  Purview steps run sequentially because they share one model's lock.
+  Purview steps run sequentially because they share one model's lock. With an
+  app-only (certificate) purview-rbac instance, the role-group steps are
+  supported but the case-admin data is best-effort, because Microsoft
+  documents app-only auth for eDiscovery cmdlets as unsupported; the output
+  is tagged authSupport / caseAdminAuthSupport. isCaseAdmin, canSearch and
+  canExport are null, not false, when a lookup failed and the answer is
+  unknown, so check for null before treating an audit as complete.
 tags: {}
 inputs:
   properties:
@@ -53,7 +59,9 @@ jobs:
         description: >-
           Snapshot every Purview role group with its management roles and
           membership, flagging which grant eDiscovery capability and which
-          grant evidence egress.
+          grant evidence egress. A group whose membership could not be read is
+          recorded with members null and the error in membersError. Supported
+          app-only.
         task:
           type: model_method
           modelIdOrName: purview-rbac
@@ -68,7 +76,12 @@ jobs:
       - name: purview-principal-access
         description: >-
           Per principal, resolve role-group membership to effective management
-          roles and record canSearch separately from canExport.
+          roles and record canSearch separately from canExport, plus
+          isCaseAdmin. canSearch / canExport are null when they depend on a
+          role group whose membership could not be read (see
+          membershipErrors), and isCaseAdmin is null when the case-admin lookup
+          failed; null means unknown, never "no". The case-admin half is
+          best-effort under app-only auth (caseAdminAuthSupport).
         task:
           type: model_method
           modelIdOrName: purview-rbac
@@ -86,7 +99,10 @@ jobs:
           List eDiscovery Administrators — the tier that can open every case in
           the tenant, including cases they were never assigned to. Captured for
           the whole tenant, not just the audited principals, because this is the
-          membership most often granted once and never reviewed.
+          membership most often granted once and never reviewed. Best-effort
+          under app-only auth (each record carries authSupport); if
+          Get-eDiscoveryCaseAdmin fails, this step fails rather than reporting
+          an empty list, so run it with a delegated instance.
         task:
           type: model_method
           modelIdOrName: purview-rbac

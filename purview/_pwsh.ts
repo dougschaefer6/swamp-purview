@@ -10,10 +10,15 @@ import { z } from "npm:zod@4.3.6";
  * on the az session; this one cannot, which is why it carries its own
  * credential surface.
  *
- * Supply appId + certificateThumbprint for unattended (app-only) runs — the
- * only mode suitable for `swamp serve` schedules. Omit both to fall back to the
- * ExchangeOnlineManagement module's own interactive/cached sign-in, which is
- * fine at a workstation but will block a scheduled run waiting for a human.
+ * Supply appId + certificateThumbprint for unattended (app-only) runs. The
+ * module documents -CertificateThumbprint as Windows-only (the certificate must
+ * sit in the Windows user certificate store), so this mode works on a Windows
+ * host only. A Linux or macOS host would need certificate-file based auth
+ * (-CertificateFilePath / -Certificate), which this model does not implement.
+ * Omit both to fall back to the ExchangeOnlineManagement module's own
+ * interactive/cached sign-in, which is fine at a workstation but will block a
+ * scheduled run waiting for a human. App-only is supported for role-group reads
+ * and writes but NOT for the eDiscovery cmdlets; see EdiscoveryAuthSupport.
  */
 export const PurviewGlobalArgsSchema = z.object({
   organization: z
@@ -31,7 +36,7 @@ export const PurviewGlobalArgsSchema = z.object({
     .string()
     .optional()
     .describe(
-      "Thumbprint of a certificate installed locally, paired with appId for unattended app-only auth.",
+      "Thumbprint of a certificate in the Windows user certificate store, paired with appId for unattended app-only auth. -CertificateThumbprint is Windows-only; this model has no certificate-file option for Linux or macOS hosts.",
     ),
   userPrincipalName: z
     .string()
@@ -43,8 +48,140 @@ export const PurviewGlobalArgsSchema = z.object({
 
 export type PurviewGlobalArgs = z.infer<typeof PurviewGlobalArgsSchema>;
 
+/** The slice of the swamp method context the Purview models use. */
+export interface PurviewMethodContext {
+  globalArgs: PurviewGlobalArgs;
+  // Only `info` is declared on purpose: swamp does not render warning-level
+  // output without -v, so a safety message logged at warn is invisible in a
+  // normal run. Everything that must be seen goes through info.
+  logger: {
+    info: (msg: string, props?: Record<string, unknown>) => void;
+  };
+  writeResource: (
+    spec: string,
+    name: string,
+    data: Record<string, unknown>,
+  ) => Promise<unknown>;
+}
+
+/** True when the session will connect app-only (certificate) rather than delegated. */
+export function isAppOnly(g: PurviewGlobalArgs): boolean {
+  return Boolean(g.appId && g.certificateThumbprint);
+}
+
+/**
+ * Microsoft support status of the eDiscovery cmdlets for this credential mode.
+ *
+ * Role-group cmdlets (Get-RoleGroup, Get-RoleGroupMember, Add-/Remove-
+ * RoleGroupMember) are ordinary RBAC cmdlets and remain supported app-only. The
+ * eDiscovery cmdlets — Get-eDiscoveryCaseAdmin, Get-ComplianceCase, the
+ * CaseHold* and ComplianceSearch* families — are not. Microsoft documents
+ * app-only auth for eDiscovery cmdlets in Security & Compliance PowerShell as
+ * unsupported, and its certificate setup steps as "best-effort guidance for
+ * existing automations":
+ * https://learn.microsoft.com/powershell/exchange/app-only-auth-powershell-v2
+ * https://learn.microsoft.com/purview/edisc-permissions
+ * They may keep working, or start failing with an opaque remote error, without
+ * notice. Delegated sign-in is the supported path.
+ */
+export type EdiscoveryAuthSupport = "supported" | "best-effort";
+
+export function ediscoveryAuthSupport(
+  g: PurviewGlobalArgs,
+): EdiscoveryAuthSupport {
+  return isAppOnly(g) ? "best-effort" : "supported";
+}
+
+/**
+ * Log a notice when an eDiscovery cmdlet is about to run app-only, and return
+ * the support status so callers can record it alongside their output. Logged
+ * at info, not warn: swamp hides warning-level output unless run with -v.
+ */
+export function warnIfAppOnlyEdiscovery(
+  g: PurviewGlobalArgs,
+  logger: { info: (msg: string, props?: Record<string, unknown>) => void },
+  cmdlets: string,
+): EdiscoveryAuthSupport {
+  const support = ediscoveryAuthSupport(g);
+  if (support === "best-effort") {
+    logger.info(
+      "{cmdlets} running with app-only (certificate) auth, which Microsoft documents as unsupported for eDiscovery cmdlets; results are best-effort. Use delegated sign-in (userPrincipalName) for a supported run.",
+      { cmdlets },
+    );
+  }
+  return support;
+}
+
+/**
+ * A failed pwshJson run. `connected` records whether the script got past its
+ * Connect-* line, which is what separates "the eDiscovery cmdlet failed" from
+ * "pwsh, the module, the certificate or the sign-in failed".
+ */
+export class PurviewPwshError extends Error {
+  constructor(
+    message: string,
+    readonly connected: boolean,
+    readonly exitCode: number,
+  ) {
+    super(message);
+    this.name = "PurviewPwshError";
+  }
+}
+
+/**
+ * Re-express a failure from an eDiscovery cmdlet run app-only so the likely
+ * cause is visible, instead of surfacing only the module's raw remote error.
+ *
+ * The hint is added only when the session actually connected and the failure
+ * came afterwards. A missing pwsh, an Import-Module failure, a certificate that
+ * is not in the store or a 401 from Connect-* happen before any eDiscovery
+ * cmdlet runs, so blaming the app-only support status for them would send the
+ * reader the wrong way; those pass through unchanged, as do delegated failures.
+ * A string error is treated as post-connect because the only strings passed
+ * here are error records captured inside the connected script body.
+ */
+export function explainEdiscoveryFailure(
+  g: PurviewGlobalArgs,
+  cmdlets: string,
+  err: unknown,
+): Error {
+  const original = err instanceof Error ? err : new Error(String(err));
+  if (!isAppOnly(g)) return original;
+  const afterConnect = typeof err === "string" ||
+    (err instanceof PurviewPwshError && err.connected);
+  if (!afterConnect) return original;
+  return new Error(
+    `${cmdlets} failed under app-only (certificate) auth after a successful ` +
+      `connect. Microsoft documents app-only auth for eDiscovery cmdlets in ` +
+      `Security & Compliance PowerShell as unsupported, so this may be the ` +
+      `cause rather than a permission gap. Its best-effort setup for existing ` +
+      `automations needs the app's service principal registered with ` +
+      `New-ServicePrincipal, that service principal made a member of the ` +
+      `eDiscoveryManager role group, ExchangeOnlineManagement 3.10.1 or later, ` +
+      `and Connect-IPPSSession -EnableSearchOnlySession ` +
+      `(https://learn.microsoft.com/purview/edisc-permissions). The supported ` +
+      `path is to re-run with userPrincipalName (delegated sign-in) instead of ` +
+      `appId + certificateThumbprint. Underlying error: ${original.message}`,
+    { cause: original },
+  );
+}
+
 const BEGIN = "<<<SWAMP_JSON_BEGIN>>>";
 const END = "<<<SWAMP_JSON_END>>>";
+const CONNECTED = "<<<SWAMP_PV_CONNECTED>>>";
+
+/**
+ * Lines on stderr that are error records. pwsh -File sends only the error
+ * stream to stderr (warnings, verbose and host output go to stdout), so any
+ * non-blank stderr line is an error record unless it carries one of the
+ * stream prefixes some hosts redirect there anyway.
+ */
+function stderrErrorLines(stderr: string): string[] {
+  return stderr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^(WARNING|VERBOSE|DEBUG|INFO):/i.test(l));
+}
 
 /**
  * Which of the three mutually exclusive PowerShell endpoints a body needs.
@@ -143,6 +280,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
 $P = Get-Content -Raw -Path $env:SWAMP_PV_PARAMS | ConvertFrom-Json
 ${connectBlock(g, mode)}
+Write-Output "${CONNECTED}"
 try {
 ${body}
 } finally {
@@ -170,14 +308,36 @@ ${body}
     const out = new TextDecoder().decode(stdout);
     const err = new TextDecoder().decode(stderr);
 
+    const connected = out.includes(CONNECTED);
+
+    // A script-level $ErrorActionPreference='Stop' does not reach functions
+    // inside the ExchangeOnlineManagement module, so a remote non-terminating
+    // error can still let the script print an empty "[]" between the markers
+    // and exit. Treat a non-zero exit or any error record on stderr as a
+    // failure rather than trusting that payload: an empty list here reads as
+    // "no admins" or "no cases", which is the wrong answer stated confidently.
+    const errorLines = stderrErrorLines(err);
+    if (code !== 0 || errorLines.length > 0) {
+      throw new PurviewPwshError(
+        `Purview PowerShell failed (exit ${code}${
+          errorLines.length ? ", error records on stderr" : ""
+        }${connected ? ", after connect" : ", before connect completed"}). ` +
+          `stderr: ${err.slice(0, 600) || "(empty)"}`,
+        connected,
+        code,
+      );
+    }
+
     const start = out.indexOf(BEGIN);
     const stop = out.indexOf(END);
     if (start === -1 || stop === -1) {
-      throw new Error(
+      throw new PurviewPwshError(
         `Purview PowerShell returned no JSON payload (exit ${code}). ` +
           `stderr: ${err.slice(0, 600) || "(empty)"} stdout: ${
             out.slice(0, 600) || "(empty)"
           }`,
+        connected,
+        code,
       );
     }
     const payload = out.slice(start + BEGIN.length, stop).trim();

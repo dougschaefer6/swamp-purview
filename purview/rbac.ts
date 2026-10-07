@@ -3,17 +3,25 @@ import {
   EDISCOVERY_ROLES,
   EGRESS_ROLES,
   emitJson,
+  explainEdiscoveryFailure,
   PurviewGlobalArgsSchema,
+  PurviewMethodContext,
   pwshJson,
   resolvePrincipal,
   sanitizeInstanceName,
+  warnIfAppOnlyEdiscovery,
 } from "./_pwsh.ts";
+
+const AuthSupportSchema = z.enum(["supported", "best-effort"]);
 
 const RoleGroupSchema = z
   .object({
     name: z.string(),
     roles: z.array(z.string()),
-    members: z.array(z.string()),
+    // null when Get-RoleGroupMember could not be read for this group, so a
+    // failed read is never recorded as an empty group. membersError says why.
+    members: z.array(z.string()).nullable(),
+    membersError: z.string().nullish(),
     grantsEdiscovery: z.boolean(),
     grantsEgress: z.boolean(),
   })
@@ -27,14 +35,23 @@ const PrincipalAccessSchema = z
     roleGroups: z.array(z.string()),
     effectiveRoles: z.array(z.string()),
     ediscoveryRoles: z.array(z.string()),
-    canSearch: z.boolean(),
-    canExport: z.boolean(),
-    isCaseAdmin: z.boolean(),
+    // canSearch / canExport are null when the answer depends on a role group
+    // whose membership could not be read (see membershipErrors), so a failed
+    // Get-RoleGroupMember is never recorded as "cannot export".
+    canSearch: z.boolean().nullable(),
+    canExport: z.boolean().nullable(),
+    membershipErrors: z
+      .array(z.object({ roleGroup: z.string(), error: z.string() }))
+      .optional(),
+    // null when Get-eDiscoveryCaseAdmin could not be read, so a failed lookup
+    // is never recorded as "not a case admin".
+    isCaseAdmin: z.boolean().nullable(),
+    caseAdminAuthSupport: AuthSupportSchema.optional(),
   })
   .passthrough();
 
 const CaseAdminSchema = z
-  .object({ name: z.string() })
+  .object({ name: z.string(), authSupport: AuthSupportSchema.optional() })
   .passthrough();
 
 /**
@@ -53,12 +70,25 @@ const CaseAdminSchema = z
  * distinction, separating canSearch from canExport.
  *
  * Authentication does not use the az session — see _pwsh.ts for why. Supply
- * appId + certificateThumbprint for unattended runs.
+ * appId + certificateThumbprint for unattended runs. That is supported for the
+ * role-group methods (syncRoleGroups, add/removeRoleGroupMember) but only
+ * best-effort for anything that calls an eDiscovery cmdlet (listCaseAdmins, the
+ * case-admin half of auditPrincipals, listCases, placeCustodianHold,
+ * runComplianceSearch); those log a notice, tag their output, and explain
+ * failures that happen after a successful connect.
  */
 export const model = {
   type: "@dougschaefer/purview-rbac",
-  version: "2026.08.11.1",
+  version: "2026.10.07.1",
   globalArguments: PurviewGlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.07.1",
+      description:
+        "Flag app-only auth as best-effort for eDiscovery cmdlets (authSupport on caseAdmin, nullable isCaseAdmin on a failed lookup); globalArguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     roleGroup: {
       description: "Purview role group with its roles and membership",
@@ -84,30 +114,43 @@ export const model = {
       description:
         "Sweep every Purview role group with its management roles and membership in one session, flagging which grant eDiscovery capability and which grant evidence egress (Export / RMS Decrypt / Preview). Fan-out by design: one PowerShell connection produces the whole RBAC picture rather than one call per group.",
       arguments: z.object({}),
-      execute: async (_args, context) => {
+      execute: async (_args: unknown, context: PurviewMethodContext) => {
         const raw = (await pwshJson(
           context.globalArgs,
           emitJson(
-            `Get-RoleGroup | ForEach-Object {
+            `Get-RoleGroup -ErrorAction Stop | ForEach-Object {
     $rg = $_
     $m = @()
-    try { $m = Get-RoleGroupMember -Identity $rg.Name -ErrorAction Stop | Select-Object -ExpandProperty Name } catch {}
+    $mErr = $null
+    # A failed membership read is reported, not swallowed: an empty list would
+    # otherwise read as "this group has no members".
+    try { $m = Get-RoleGroupMember -Identity $rg.Name -ErrorAction Stop | Select-Object -ExpandProperty Name } catch { $mErr = [string]$_ }
     [PSCustomObject]@{
-      name    = $rg.Name
-      roles   = @($rg.Roles | ForEach-Object { ($_ -split '/')[-1] })
-      members = @($m)
+      name         = $rg.Name
+      roles        = @($rg.Roles | ForEach-Object { ($_ -split '/')[-1] })
+      members      = @($m)
+      membersError = $mErr
     }
   }`,
           ),
-        )) as Array<{ name: string; roles?: string[]; members?: string[] }>;
+        )) as Array<{
+          name: string;
+          roles?: string[];
+          members?: string[];
+          membersError?: string | null;
+        }>;
 
         const handles = [];
+        const unreadable: string[] = [];
         for (const rg of raw ?? []) {
           const roles = rg.roles ?? [];
+          const membersError = rg.membersError || null;
+          if (membersError) unreadable.push(rg.name);
           const record = {
             name: rg.name,
             roles,
-            members: rg.members ?? [],
+            members: membersError ? null : rg.members ?? [],
+            membersError,
             grantsEdiscovery: roles.some((r) =>
               (EDISCOVERY_ROLES as readonly string[]).includes(r)
             ),
@@ -136,6 +179,12 @@ export const model = {
               ).length,
           },
         );
+        if (unreadable.length > 0) {
+          context.logger.info(
+            "Membership of {count} role group(s) could not be read and is recorded as null with membersError: {groups}",
+            { count: unreadable.length, groups: unreadable.join(", ") },
+          );
+        }
         return { dataHandles: handles };
       },
     },
@@ -144,11 +193,27 @@ export const model = {
       description:
         "List the eDiscovery Administrators — the tier that can open every case in the tenant, including cases they were never assigned to.",
       arguments: z.object({}),
-      execute: async (_args, context) => {
-        const raw = (await pwshJson(
+      execute: async (_args: unknown, context: PurviewMethodContext) => {
+        const authSupport = warnIfAppOnlyEdiscovery(
           context.globalArgs,
-          emitJson(`Get-eDiscoveryCaseAdmin | Select-Object Name`),
-        )) as Array<{ Name?: string }>;
+          context.logger,
+          "Get-eDiscoveryCaseAdmin",
+        );
+        let raw: Array<{ Name?: string }>;
+        try {
+          raw = (await pwshJson(
+            context.globalArgs,
+            emitJson(
+              `Get-eDiscoveryCaseAdmin -ErrorAction Stop | Select-Object Name`,
+            ),
+          )) as Array<{ Name?: string }>;
+        } catch (err) {
+          throw explainEdiscoveryFailure(
+            context.globalArgs,
+            "Get-eDiscoveryCaseAdmin",
+            err,
+          );
+        }
 
         const handles = [];
         for (const a of raw ?? []) {
@@ -157,13 +222,14 @@ export const model = {
             await context.writeResource(
               "caseAdmin",
               sanitizeInstanceName(a.Name),
-              { name: a.Name },
+              { name: a.Name, authSupport },
             ),
           );
         }
-        context.logger.info("Found {count} eDiscovery Administrators", {
-          count: handles.length,
-        });
+        context.logger.info(
+          "Found {count} eDiscovery Administrators (auth support: {support})",
+          { count: handles.length, support: authSupport },
+        );
         return { dataHandles: handles };
       },
     },
@@ -179,37 +245,80 @@ export const model = {
             "Display names or UPNs to evaluate. Role group membership is reported by display name, so either form is accepted and matched case-insensitively.",
           ),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: { principals: string[] },
+        context: PurviewMethodContext,
+      ) => {
+        const caseAdminAuthSupport = warnIfAppOnlyEdiscovery(
+          context.globalArgs,
+          context.logger,
+          "Get-eDiscoveryCaseAdmin",
+        );
         const raw = (await pwshJson(
           context.globalArgs,
           emitJson(
-            `$groups = Get-RoleGroup | ForEach-Object {
+            `$groups = Get-RoleGroup -ErrorAction Stop | ForEach-Object {
     $rg = $_
     $m = @()
-    try { $m = Get-RoleGroupMember -Identity $rg.Name -ErrorAction Stop | ForEach-Object { $_.Name; $_.WindowsLiveID; $_.PrimarySmtpAddress } } catch {}
+    $mErr = $null
+    # Reported, not swallowed: a failed read must not look like "not a member".
+    try { $m = Get-RoleGroupMember -Identity $rg.Name -ErrorAction Stop | ForEach-Object { $_.Name; $_.WindowsLiveID; $_.PrimarySmtpAddress } } catch { $mErr = [string]$_ }
     [PSCustomObject]@{
-      name    = $rg.Name
-      roles   = @($rg.Roles | ForEach-Object { ($_ -split '/')[-1] })
-      members = @($m | Where-Object { $_ })
+      name         = $rg.Name
+      roles        = @($rg.Roles | ForEach-Object { ($_ -split '/')[-1] })
+      members      = @($m | Where-Object { $_ })
+      membersError = $mErr
     }
   }
+  # Get-eDiscoveryCaseAdmin is an eDiscovery cmdlet, unsupported app-only, so
+  # its failure is reported rather than swallowed: an empty list would
+  # otherwise read as "nobody is a case admin".
   $admins = @()
-  try { $admins = Get-eDiscoveryCaseAdmin | Select-Object -ExpandProperty Name } catch {}
-  [PSCustomObject]@{ groups = $groups; caseAdmins = @($admins) }`,
+  $adminError = $null
+  try { $admins = Get-eDiscoveryCaseAdmin -ErrorAction Stop | Select-Object -ExpandProperty Name } catch { $adminError = [string]$_ }
+  [PSCustomObject]@{ groups = $groups; caseAdmins = @($admins); caseAdminError = $adminError }`,
           ),
         )) as Array<{
-          groups?: Array<
-            { name: string; roles?: string[]; members?: string[] }
-          >;
+          groups?: Array<{
+            name: string;
+            roles?: string[];
+            members?: string[];
+            membersError?: string | null;
+          }>;
           caseAdmins?: string[];
+          caseAdminError?: string | null;
         }>;
 
         // -AsArray wraps the single object; unwrap it.
         const payload = Array.isArray(raw) ? raw[0] : raw;
-        const groups = payload?.groups ?? [];
+        const allGroups = payload?.groups ?? [];
+        const groups = allGroups.filter((g) => !g.membersError);
+        const unreadableGroups = allGroups.filter((g) => g.membersError);
+        if (unreadableGroups.length > 0) {
+          context.logger.info(
+            "Membership of {count} role group(s) could not be read; canSearch/canExport are recorded as null where they depend on one: {groups}",
+            {
+              count: unreadableGroups.length,
+              groups: unreadableGroups.map((g) => g.name).join(", "),
+            },
+          );
+        }
         const caseAdmins = (payload?.caseAdmins ?? []).map((a) =>
           a.toLowerCase()
         );
+        const caseAdminError = payload?.caseAdminError || null;
+        if (caseAdminError) {
+          context.logger.info(
+            "Case-admin lookup failed; isCaseAdmin recorded as null rather than false. {error}",
+            {
+              error: explainEdiscoveryFailure(
+                context.globalArgs,
+                "Get-eDiscoveryCaseAdmin",
+                caseAdminError,
+              ).message,
+            },
+          );
+        }
 
         const handles = [];
         for (const principal of args.principals) {
@@ -238,13 +347,29 @@ export const model = {
           const ediscoveryRoles = effectiveRoles.filter((r) =>
             (EDISCOVERY_ROLES as readonly string[]).includes(r)
           );
-          const canExport = effectiveRoles.some((r) =>
-            (EGRESS_ROLES as readonly string[]).includes(r)
-          );
-          const canSearch = effectiveRoles.includes("Compliance Search") ||
-            effectiveRoles.includes("Case Management");
+          const isEgress = (r: string) =>
+            (EGRESS_ROLES as readonly string[]).includes(r);
+          const isSearch = (r: string) =>
+            r === "Compliance Search" || r === "Case Management";
+          // A capability is known true from any readable group that grants it.
+          // Otherwise it is unknown (null) if an unreadable group grants it,
+          // because the principal may be a member we could not see.
+          const capability = (grants: (r: string) => boolean) =>
+            effectiveRoles.some(grants)
+              ? true
+              : unreadableGroups.some((g) => (g.roles ?? []).some(grants))
+              ? null
+              : false;
+          const canExport = capability(isEgress);
+          const canSearch = capability(isSearch);
+          const membershipErrors = unreadableGroups.map((g) => ({
+            roleGroup: g.name,
+            error: String(g.membersError),
+          }));
           // Case-admin entries carry a "(Shared)" suffix for shared mailboxes.
-          const isCaseAdmin = caseAdmins.some((a) => norm(a) === needle);
+          const isCaseAdmin = caseAdminError
+            ? null
+            : caseAdmins.some((a) => norm(a) === needle);
 
           context.logger.info(
             "{principal}: search={search} export={export} caseAdmin={admin} via {groups} role group(s)",
@@ -270,7 +395,9 @@ export const model = {
                 ediscoveryRoles,
                 canSearch,
                 canExport,
+                ...(membershipErrors.length ? { membershipErrors } : {}),
                 isCaseAdmin,
+                caseAdminAuthSupport,
               },
             ),
           );
@@ -283,11 +410,27 @@ export const model = {
       description:
         "List eDiscovery (compliance) cases with their status, so a search or hold can be attached to the exact case name Purview holds rather than a paraphrase of it.",
       arguments: z.object({}),
-      execute: async (_args, context) => {
-        const raw = (await pwshJson(
+      execute: async (_args: unknown, context: PurviewMethodContext) => {
+        warnIfAppOnlyEdiscovery(
           context.globalArgs,
-          emitJson(`Get-ComplianceCase | Select-Object Name, Status, Identity`),
-        )) as Array<{ Name?: string; Status?: string }>;
+          context.logger,
+          "Get-ComplianceCase",
+        );
+        let raw: Array<{ Name?: string; Status?: string }>;
+        try {
+          raw = (await pwshJson(
+            context.globalArgs,
+            emitJson(
+              `Get-ComplianceCase -ErrorAction Stop | Select-Object Name, Status, Identity`,
+            ),
+          )) as Array<{ Name?: string; Status?: string }>;
+        } catch (err) {
+          throw explainEdiscoveryFailure(
+            context.globalArgs,
+            "Get-ComplianceCase",
+            err,
+          );
+        }
         for (const c of raw ?? []) {
           context.logger.info("case: {name} [{status}]", {
             name: c.Name,
@@ -317,7 +460,20 @@ export const model = {
             "Optional KQL to scope the hold. Omit for a full-mailbox hold, which is the defensible default.",
           ),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: {
+          caseName: string;
+          holdName: string;
+          mailboxes: string[];
+          contentQuery?: string;
+        },
+        context: PurviewMethodContext,
+      ) => {
+        warnIfAppOnlyEdiscovery(
+          context.globalArgs,
+          context.logger,
+          "New-CaseHoldPolicy / New-CaseHoldRule",
+        );
         await pwshJson(
           context.globalArgs,
           emitJson(
@@ -364,7 +520,20 @@ export const model = {
           .describe("Mailbox UPNs to search"),
         contentQuery: z.string().describe("KQL content query"),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: {
+          caseName: string;
+          searchName: string;
+          mailboxes: string[];
+          contentQuery: string;
+        },
+        context: PurviewMethodContext,
+      ) => {
+        warnIfAppOnlyEdiscovery(
+          context.globalArgs,
+          context.logger,
+          "New-ComplianceSearch / Start-ComplianceSearch",
+        );
         const raw = await pwshJson(
           context.globalArgs,
           emitJson(
@@ -420,7 +589,10 @@ export const model = {
         ),
         member: z.string().describe("UPN of the principal to add"),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: { roleGroup: string; member: string },
+        context: PurviewMethodContext,
+      ) => {
         await pwshJson(
           context.globalArgs,
           emitJson(
@@ -446,7 +618,10 @@ export const model = {
         ),
         member: z.string().describe("UPN of the principal to remove"),
       }),
-      execute: async (args, context) => {
+      execute: async (
+        args: { roleGroup: string; member: string },
+        context: PurviewMethodContext,
+      ) => {
         await pwshJson(
           context.globalArgs,
           emitJson(
@@ -476,7 +651,7 @@ export const model = {
         "addRoleGroupMember",
         "removeRoleGroupMember",
       ],
-      execute: async (_context) => {
+      execute: async (_context: unknown) => {
         try {
           const cmd = new Deno.Command("pwsh", {
             args: [
