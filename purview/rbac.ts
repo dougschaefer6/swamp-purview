@@ -9,6 +9,7 @@ import {
   pwshJson,
   resolvePrincipal,
   sanitizeInstanceName,
+  transitiveGroupNames,
   warnIfAppOnlyEdiscovery,
 } from "./_pwsh.ts";
 
@@ -22,6 +23,10 @@ const RoleGroupSchema = z
     // failed read is never recorded as an empty group. membersError says why.
     members: z.array(z.string()).nullable(),
     membersError: z.string().nullish(),
+    // Members that are themselves groups (e.g. a mail-enabled security
+    // group). Their users hold this group's roles without appearing in
+    // members, so auditPrincipals expands them through Graph.
+    groupMembers: z.array(z.string()).nullish(),
     grantsEdiscovery: z.boolean(),
     grantsEgress: z.boolean(),
   })
@@ -79,13 +84,19 @@ const CaseAdminSchema = z
  */
 export const model = {
   type: "@dougschaefer/purview-rbac",
-  version: "2026.10.07.1",
+  version: "2026.10.08.1",
   globalArguments: PurviewGlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.10.07.1",
       description:
         "Flag app-only auth as best-effort for eDiscovery cmdlets (authSupport on caseAdmin, nullable isCaseAdmin on a failed lookup); globalArguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.08.1",
+      description:
+        "Role-group membership read with -ResultSize Unlimited; access granted through nested groups expanded via Graph (unknown, not false, when that fails); globalArguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -124,11 +135,18 @@ export const model = {
     $mErr = $null
     # A failed membership read is reported, not swallowed: an empty list would
     # otherwise read as "this group has no members".
-    try { $m = Get-RoleGroupMember -Identity $rg.Name -ErrorAction Stop | Select-Object -ExpandProperty Name } catch { $mErr = [string]$_ }
+    # -ResultSize Unlimited: the default stops at 1000 members, silently.
+    $g = @()
+    try {
+      $raw = @(Get-RoleGroupMember -Identity $rg.Name -ResultSize Unlimited -ErrorAction Stop)
+      $m = @($raw | Select-Object -ExpandProperty Name)
+      $g = @($raw | Where-Object { [string]$_.RecipientType -like '*Group*' } | Select-Object -ExpandProperty Name)
+    } catch { $mErr = [string]$_ }
     [PSCustomObject]@{
       name         = $rg.Name
       roles        = @($rg.Roles | ForEach-Object { ($_ -split '/')[-1] })
       members      = @($m)
+      groupMembers = @($g)
       membersError = $mErr
     }
   }`,
@@ -137,6 +155,7 @@ export const model = {
           name: string;
           roles?: string[];
           members?: string[];
+          groupMembers?: string[];
           membersError?: string | null;
         }>;
 
@@ -151,6 +170,7 @@ export const model = {
             roles,
             members: membersError ? null : rg.members ?? [],
             membersError,
+            groupMembers: membersError ? null : rg.groupMembers ?? [],
             grantsEdiscovery: roles.some((r) =>
               (EDISCOVERY_ROLES as readonly string[]).includes(r)
             ),
@@ -262,11 +282,18 @@ export const model = {
     $m = @()
     $mErr = $null
     # Reported, not swallowed: a failed read must not look like "not a member".
-    try { $m = Get-RoleGroupMember -Identity $rg.Name -ErrorAction Stop | ForEach-Object { $_.Name; $_.WindowsLiveID; $_.PrimarySmtpAddress } } catch { $mErr = [string]$_ }
+    # -ResultSize Unlimited: the default stops at 1000 members, silently.
+    $g = @()
+    try {
+      $raw = @(Get-RoleGroupMember -Identity $rg.Name -ResultSize Unlimited -ErrorAction Stop)
+      $m = @($raw | ForEach-Object { $_.Name; $_.WindowsLiveID; $_.PrimarySmtpAddress })
+      $g = @($raw | Where-Object { [string]$_.RecipientType -like '*Group*' } | Select-Object -ExpandProperty Name)
+    } catch { $mErr = [string]$_ }
     [PSCustomObject]@{
       name         = $rg.Name
       roles        = @($rg.Roles | ForEach-Object { ($_ -split '/')[-1] })
       members      = @($m | Where-Object { $_ })
+      groupMembers = @($g | Where-Object { $_ })
       membersError = $mErr
     }
   }
@@ -283,6 +310,7 @@ export const model = {
             name: string;
             roles?: string[];
             members?: string[];
+            groupMembers?: string[];
             membersError?: string | null;
           }>;
           caseAdmins?: string[];
@@ -337,9 +365,40 @@ export const model = {
               .trim();
           const needle = norm(resolved.displayName);
 
-          const memberOf = groups.filter((g) =>
+          const direct = groups.filter((g) =>
             (g.members ?? []).some((m) => norm(String(m)) === needle)
           );
+          // Role groups that grant through a nested group the principal is
+          // not already a direct member of. Expand them via Graph; if that
+          // lookup fails, those groups become unknown for this principal
+          // rather than "not a member".
+          const viaGroups = groups.filter((g) =>
+            !direct.includes(g) && (g.groupMembers ?? []).length > 0
+          );
+          const nested: typeof groups = [];
+          const nestedUnknown: typeof groups = [];
+          let nestedError: string | null = null;
+          if (viaGroups.length > 0) {
+            try {
+              const mine = new Set(
+                [...await transitiveGroupNames(resolved.id)].map(norm),
+              );
+              for (const g of viaGroups) {
+                if ((g.groupMembers ?? []).some((n) => mine.has(norm(n)))) {
+                  nested.push(g);
+                }
+              }
+            } catch (err) {
+              nestedError = err instanceof Error ? err.message : String(err);
+              nestedUnknown.push(...viaGroups);
+              context.logger.info(
+                "Nested-group lookup failed for {principal}; role groups granted through a group are recorded as unknown: {error}",
+                { principal, error: nestedError },
+              );
+            }
+          }
+          const memberOf = [...direct, ...nested];
+          const unknownGroups = [...unreadableGroups, ...nestedUnknown];
 
           const effectiveRoles = [
             ...new Set(memberOf.flatMap((g) => g.roles ?? [])),
@@ -357,15 +416,21 @@ export const model = {
           const capability = (grants: (r: string) => boolean) =>
             effectiveRoles.some(grants)
               ? true
-              : unreadableGroups.some((g) => (g.roles ?? []).some(grants))
+              : unknownGroups.some((g) => (g.roles ?? []).some(grants))
               ? null
               : false;
           const canExport = capability(isEgress);
           const canSearch = capability(isSearch);
-          const membershipErrors = unreadableGroups.map((g) => ({
-            roleGroup: g.name,
-            error: String(g.membersError),
-          }));
+          const membershipErrors = [
+            ...unreadableGroups.map((g) => ({
+              roleGroup: g.name,
+              error: String(g.membersError),
+            })),
+            ...nestedUnknown.map((g) => ({
+              roleGroup: g.name,
+              error: `nested group membership unresolved: ${nestedError}`,
+            })),
+          ];
           // Case-admin entries carry a "(Shared)" suffix for shared mailboxes.
           const isCaseAdmin = caseAdminError
             ? null

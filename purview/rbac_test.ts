@@ -115,6 +115,47 @@ const listCaseAdmins = model.methods.listCaseAdmins.execute as AnyExecute;
 const auditPrincipals = model.methods.auditPrincipals.execute as AnyExecute;
 const listCases = model.methods.listCases.execute as AnyExecute;
 const syncRoleGroups = model.methods.syncRoleGroups.execute as AnyExecute;
+const sweepActivity = auditModel.methods.sweepActivity.execute as AnyExecute;
+const previewSearch = auditModel.methods.previewSearch.execute as AnyExecute;
+
+/**
+ * Stub Graph with routing: the user lookup returns `user`, and
+ * transitiveMemberOf returns `groups` (or `groupsStatus` when set).
+ */
+async function withGraphRoutes(
+  user: { displayName: string; userPrincipalName: string },
+  groups: string[],
+  fn: () => Promise<void>,
+  groupsStatus = 200,
+): Promise<void> {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("/transitiveMemberOf")) {
+      return Promise.resolve(
+        groupsStatus === 200
+          ? new Response(
+            JSON.stringify({
+              value: groups.map((displayName) => ({ displayName })),
+            }),
+            { status: 200 },
+          )
+          : new Response("throttled", { status: groupsStatus }),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({ id: "00000000-0000-0000-0000-000000000003", ...user }),
+        { status: 200 },
+      ),
+    );
+  }) as typeof fetch;
+  try {
+    await fn();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
 
 /** Stub Graph so resolvePrincipal returns one fixed example user. */
 async function withGraphUser(
@@ -507,12 +548,163 @@ Deno.test("A6 auditPrincipals: a readable grant stays true despite other errors"
   );
 });
 
-Deno.test("models carry 2026.10.07.1 with an identity upgrade", () => {
+Deno.test("models carry 2026.10.08.1 with an identity upgrade", () => {
   for (const m of [model, auditModel]) {
-    assertEquals(m.version, "2026.10.07.1");
+    assertEquals(m.version, "2026.10.08.1");
     const last = m.upgrades[m.upgrades.length - 1];
-    assertEquals(last.toVersion, "2026.10.07.1");
+    assertEquals(last.toVersion, "2026.10.08.1");
     const old = { organization: "contoso.onmicrosoft.com" };
     assertEquals(last.upgradeAttributes(old), old);
   }
+});
+
+const NESTED_PAYLOAD = payload([{
+  groups: [
+    {
+      name: "eDiscoveryManager",
+      roles: ["Compliance Search", "Export"],
+      members: ["Legal Reviewers"],
+      groupMembers: ["Legal Reviewers"],
+      membersError: null,
+    },
+  ],
+  caseAdmins: [],
+  caseAdminError: null,
+}]);
+
+Deno.test("auditPrincipals: export granted through a nested group is true", async () => {
+  await withGraphRoutes(
+    { displayName: "Alice Example", userPrincipalName: "alice@example.com" },
+    ["Legal Reviewers", "All Staff"],
+    () =>
+      withFakeShell(NESTED_PAYLOAD, async (scriptPath) => {
+        const { context, written } = makeContext(DELEGATED);
+        await auditPrincipals({ principals: ["alice@example.com"] }, context);
+        const rec = written[0].data as Record<string, unknown>;
+        assertEquals(rec.canExport, true);
+        assertEquals(rec.roleGroups, ["eDiscoveryManager"]);
+        const script = await Deno.readTextFile(scriptPath);
+        assertStringIncludes(script, "-ResultSize Unlimited");
+      }),
+  );
+});
+
+Deno.test("auditPrincipals: a failed nested-group lookup is null, not false", async () => {
+  await withGraphRoutes(
+    { displayName: "Alice Example", userPrincipalName: "alice@example.com" },
+    [],
+    () =>
+      withFakeShell(NESTED_PAYLOAD, async () => {
+        const { context, written } = makeContext(DELEGATED);
+        await auditPrincipals({ principals: ["alice@example.com"] }, context);
+        const rec = written[0].data as Record<string, unknown>;
+        assertEquals(rec.canExport, null);
+        const errs = rec.membershipErrors as Array<{ roleGroup: string }>;
+        assertEquals(errs.map((e) => e.roleGroup), ["eDiscoveryManager"]);
+      }),
+    429,
+  );
+});
+
+Deno.test("auditPrincipals: not in the nested group stays false", async () => {
+  await withGraphRoutes(
+    { displayName: "Bob Example", userPrincipalName: "bob@example.com" },
+    ["All Staff"],
+    () =>
+      withFakeShell(NESTED_PAYLOAD, async () => {
+        const { context, written } = makeContext(DELEGATED);
+        await auditPrincipals({ principals: ["bob@example.com"] }, context);
+        const rec = written[0].data as Record<string, unknown>;
+        assertEquals(rec.canExport, false);
+      }),
+  );
+});
+
+Deno.test("sweepActivity: an audit search error rejects instead of reading as no activity", async () => {
+  await withFakeShell(
+    `${CONNECTED}\n`,
+    async (scriptPath) => {
+      const { context, written } = makeContext(DELEGATED);
+      await assertRejects(
+        () =>
+          sweepActivity({
+            principals: ["alice@example.com"],
+            startDate: "2026-01-01",
+            endDate: "2026-01-10",
+            chunkDays: 15,
+            recordTypes: ["ExchangeItem"],
+          }, context),
+        PurviewPwshError,
+      );
+      assertEquals(written.length, 0);
+      const script = await Deno.readTextFile(scriptPath);
+      assertStringIncludes(script, "-ResultSize 5000 -ErrorAction Stop");
+      const search = script.slice(
+        script.indexOf("Search-UnifiedAuditLog"),
+        script.indexOf("if ($sw)"),
+      );
+      assert(!search.includes("-ErrorAction SilentlyContinue"));
+      // "Search duration too long" arrives as a warning with zero rows;
+      // the sweep must capture warnings and throw on them.
+      assertStringIncludes(script, "-WarningVariable sw");
+      assertStringIncludes(script, "if ($sw) {");
+    },
+    {
+      stderr:
+        "Search-UnifiedAuditLog: The operation could not be performed because the server is busy.\n",
+      exitCode: 1,
+    },
+  );
+});
+
+Deno.test("sweepActivity: truncated flag propagates to every profile", async () => {
+  await withFakeShell(
+    payload([{ truncated: true, records: [] }]),
+    async () => {
+      const { context, written } = makeContext(DELEGATED);
+      await sweepActivity({
+        principals: ["alice@example.com"],
+        startDate: "2026-01-01",
+        endDate: "2026-01-10",
+        chunkDays: 15,
+        recordTypes: ["ExchangeItem"],
+      }, context);
+      const rec = written[0].data as Record<string, unknown>;
+      assertEquals(rec.truncated, true);
+      assertEquals(rec.eventCount, 0);
+    },
+  );
+});
+
+Deno.test("sweepActivity: a reversed window is refused before any search", async () => {
+  const { context } = makeContext(DELEGATED);
+  await assertRejects(
+    () =>
+      sweepActivity({
+        principals: ["alice@example.com"],
+        startDate: "2026-02-01",
+        endDate: "2026-01-01",
+        chunkDays: 15,
+        recordTypes: ["ExchangeItem"],
+      }, context),
+    Error,
+    "must be after startDate",
+  );
+});
+
+Deno.test("previewSearch: an incomplete preview throws and writes nothing", async () => {
+  await withFakeShell(
+    payload([{ Status: "InProgress", Results: "" }]),
+    async (scriptPath) => {
+      const { context, written } = makeContext(DELEGATED);
+      await assertRejects(
+        () => previewSearch({ searchName: "s1", timeoutMinutes: 1 }, context),
+        Error,
+        "did not complete",
+      );
+      assertEquals(written.length, 0);
+      const script = await Deno.readTextFile(scriptPath);
+      assertStringIncludes(script, "-Details -ErrorAction Stop");
+    },
+  );
 });

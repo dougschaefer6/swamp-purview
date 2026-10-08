@@ -496,3 +496,47 @@ export async function resolvePrincipal(
       `a principal that genuinely holds no access.`,
   );
 }
+
+/**
+ * Display names of every group a user belongs to, directly or through nesting,
+ * via Graph transitiveMemberOf. Role-group membership in Purview can be granted
+ * through a mail-enabled security group, and Get-RoleGroupMember lists only the
+ * group, so matching the user's own name against it misses the grant.
+ *
+ * Throws on any Graph failure rather than returning a partial set: a missing
+ * page would read as "not a member", the same false negative this exists to
+ * prevent.
+ *
+ * @param userId - directory object id of the user
+ * @returns the display names of all transitive group memberships
+ */
+export async function transitiveGroupNames(
+  userId: string,
+): Promise<Set<string>> {
+  const token = await graphToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const names = new Set<string>();
+  let next: string | undefined = `https://graph.microsoft.com/v1.0/users/${
+    encodeURIComponent(userId)
+  }/transitiveMemberOf?$select=displayName&$top=999`;
+  while (next) {
+    const resp: Response = await fetch(next, { headers });
+    if (!resp.ok) {
+      throw new Error(
+        `Graph transitiveMemberOf failed: ${resp.status} ${
+          (await resp.text()).slice(0, 300)
+        }`,
+      );
+    }
+    const body = await resp.json() as {
+      value?: Array<{ displayName?: string | null }>;
+      "@odata.nextLink"?: string;
+    };
+    if (!Array.isArray(body.value)) {
+      throw new Error("Graph transitiveMemberOf returned no value array");
+    }
+    for (const g of body.value) if (g.displayName) names.add(g.displayName);
+    next = body["@odata.nextLink"];
+  }
+  return names;
+}

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@dougschaefer/purview"
-version: "2026.10.07.1"
+version: "2026.10.08.1"
 description: "Microsoft Purview compliance-portal RBAC — role groups, their constituent management roles, membership, and the eDiscovery Administrator list, over Security & Compliance PowerShell. Exists because eDiscovery permission is invisible from Entra: Global Administrator maps to OrganizationManagement, which carries Case Management, Compliance Search, Hold and Search And Purge but not Export, Preview, Review, RMS Decrypt or Custodian, so a tenant admin can run a search yet be unable to export a single item. auditPrincipals separates canSearch from canExport and flags eDiscovery Administrators, who can open every case in the tenant. Carries its own credential surface because the compliance endpoint rejects Azure CLI tokens regardless of user."
 repository: https://github.com/dougschaefer6/swamp-purview
 additionalFiles:

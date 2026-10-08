@@ -38,6 +38,9 @@ const DeletionProfileSchema = z
     byOperation: z.record(z.string(), z.number()),
     byFolder: z.record(z.string(), z.number()),
     events: z.array(DeletionEventSchema),
+    // True when a search session hit the ReturnLargeSet ceiling, so events
+    // beyond it were never returned. Narrow chunkDays and re-run.
+    truncated: z.boolean().optional(),
   })
   .passthrough();
 
@@ -74,9 +77,14 @@ const PreviewResultSchema = z
     status: z.string().nullish(),
     itemCount: z.number(),
     recoverableItemCount: z.number(),
+    // True at the service's ~1000-item preview cap: more items may exist.
+    truncated: z.boolean().optional(),
     items: z.array(PreviewItemSchema),
   })
   .passthrough();
+
+/** Service cap on items returned by a compliance-search Preview action. */
+const PREVIEW_ITEM_CAP = 1000;
 
 /** Mailbox audit operations that destroy or displace a message. */
 const DELETION_OPERATIONS = [
@@ -137,13 +145,19 @@ interface RawRecord {
  */
 export const model = {
   type: "@dougschaefer/purview-audit",
-  version: "2026.10.07.1",
+  version: "2026.10.08.1",
   globalArguments: PurviewGlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.10.07.1",
       description:
         "previewSearch warns that app-only auth is best-effort for eDiscovery cmdlets; globalArguments unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.08.1",
+      description:
+        "Audit search and preview poll fail loudly instead of returning empty results; truncated flags; UTC date window; globalArguments unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -194,7 +208,7 @@ export const model = {
           .max(90)
           .default(15)
           .describe(
-            "Days per search slice. Raising this risks the 'Search duration too long' rejection, which surfaces as a warning and zero rows rather than an error.",
+            "Days per search slice. Raising this risks the 'Search duration too long' rejection, which the service returns as a warning with zero rows; the sweep treats any warning as a failure rather than an empty result.",
           ),
         recordTypes: z
           .array(z.string())
@@ -211,13 +225,30 @@ export const model = {
         },
         context: PurviewMethodContext,
       ) => {
+        const start = Date.parse(args.startDate);
+        const end = Date.parse(args.endDate);
+        if (Number.isNaN(start) || Number.isNaN(end)) {
+          throw new Error(
+            `startDate and endDate must be ISO dates (got '${args.startDate}', '${args.endDate}')`,
+          );
+        }
+        if (end <= start) {
+          throw new Error(
+            `endDate (${args.endDate}) must be after startDate (${args.startDate}); a reversed window returns nothing and would read as no activity`,
+          );
+        }
         const raw = (await pwshJson(
           context.globalArgs,
           emitJson(
-            `$start = [datetime]::Parse($P.startDate)
-  $end   = [datetime]::Parse($P.endDate)
+            `# Dates without an offset are UTC, not host-local: AssumeUniversal plus
+  # AdjustToUniversal yields Kind=Utc, so the window never shifts by the
+  # host's offset.
+  $utc   = [System.Globalization.DateTimeStyles]'AssumeUniversal,AdjustToUniversal'
+  $start = [datetime]::Parse($P.startDate, [cultureinfo]::InvariantCulture, $utc)
+  $end   = [datetime]::Parse($P.endDate, [cultureinfo]::InvariantCulture, $utc)
   $chunk = [int]$P.chunkDays
   $rows  = New-Object System.Collections.ArrayList
+  $truncated = $false
   $cursor = $start
   while ($cursor -lt $end) {
     $slice = $cursor.AddDays($chunk)
@@ -227,18 +258,32 @@ export const model = {
       # scoped to the session, and reusing one across slices silently drops
       # results from the later slice.
       $sid = [guid]::NewGuid().ToString()
+      $seen = 0
       do {
-        $batch = Search-UnifiedAuditLog -StartDate $cursor -EndDate $slice \`
+        # -ErrorAction Stop: SilentlyContinue turned a throttle or a
+        # permission error into an empty page, which ended the loop and read
+        # as "this person deleted nothing". "Search duration too long" comes
+        # back on the WARNING stream with zero rows, which -ErrorAction does
+        # not see, so any warning fails the sweep too.
+        $sw = $null
+        $batch = @(Search-UnifiedAuditLog -StartDate $cursor -EndDate $slice \`
           -UserIds @($P.principals) -RecordType $rt -SessionId $sid \`
-          -SessionCommand ReturnLargeSet -ResultSize 5000 -ErrorAction SilentlyContinue
-        # @() is load-bearing: a page holding exactly one record arrives as a
-        # scalar, and AddRange rejects it.
-        if ($batch) { [void]$rows.AddRange(@($batch)) }
-      } while ($batch -and $batch.Count -gt 0)
+          -SessionCommand ReturnLargeSet -ResultSize 5000 -ErrorAction Stop \`
+          -WarningVariable sw -WarningAction SilentlyContinue)
+        if ($sw) {
+          throw "Search-UnifiedAuditLog warned for $cursor..$slice ($rt): $($sw -join '; ')"
+        }
+        if ($batch.Count -gt 0) {
+          [void]$rows.AddRange($batch)
+          $seen += $batch.Count
+          # ResultCount is the session total; ReturnLargeSet stops at 50000.
+          if ([int]$batch[0].ResultCount -gt 50000 -or $seen -ge 50000) { $truncated = $true }
+        }
+      } while ($batch.Count -gt 0 -and $seen -lt 50000)
     }
     $cursor = $slice
   }
-  $rows | Sort-Object Identity -Unique | ForEach-Object {
+  $records = @($rows | Sort-Object Identity -Unique | ForEach-Object {
     [PSCustomObject]@{
       t     = $_.CreationDate.ToString('o')
       actor = [string]$_.UserIds
@@ -246,7 +291,8 @@ export const model = {
       rt    = [string]$_.RecordType
       data  = [string]$_.AuditData
     }
-  }`,
+  })
+  [PSCustomObject]@{ truncated = $truncated; records = $records }`,
           ),
           {
             principals: args.principals,
@@ -256,9 +302,19 @@ export const model = {
             recordTypes: args.recordTypes,
           },
           "exchange",
-        )) as RawRecord[] | null;
+        )) as
+          | Array<{ truncated?: boolean; records?: RawRecord[] }>
+          | null;
 
-        const records = raw ?? [];
+        // -AsArray wraps the single object; unwrap it.
+        const payload = Array.isArray(raw) ? raw[0] : raw;
+        const records = payload?.records ?? [];
+        const truncated = payload?.truncated === true;
+        if (truncated) {
+          context.logger.info(
+            "Audit search hit the 50,000-result ReturnLargeSet ceiling in at least one slice; deletion profiles are marked truncated. Lower chunkDays and re-run.",
+          );
+        }
         const swept = new Set(
           args.principals.map((p) => p.toLowerCase()),
         );
@@ -278,6 +334,7 @@ export const model = {
             byOperation: {},
             byFolder: {},
             events: [],
+            truncated,
           });
         }
 
@@ -443,8 +500,10 @@ export const model = {
   $deadline = (Get-Date).AddMinutes([int]$P.timeoutMinutes)
   do {
     Start-Sleep -Seconds 15
-    $a = Get-ComplianceSearchAction -Identity $name -Details -ErrorAction SilentlyContinue
-  } while ($a -and $a.Status -ne 'Completed' -and (Get-Date) -lt $deadline)
+    # -ErrorAction Stop: a failed poll must not leave $a null and fall through
+    # to a zero-item result that reads as "nothing found".
+    $a = Get-ComplianceSearchAction -Identity $name -Details -ErrorAction Stop
+  } while ($a.Status -ne 'Completed' -and (Get-Date) -lt $deadline)
   [PSCustomObject]@{
     Status  = [string]$a.Status
     Results = [string]$a.Results
@@ -462,6 +521,13 @@ export const model = {
           Status?: string;
           Results?: string;
         } | null;
+        if (r?.Status !== "Completed") {
+          throw new Error(
+            `Preview action for '${args.searchName}' did not complete within ${args.timeoutMinutes} minute(s) (status: ${
+              r?.Status || "unknown"
+            }). Nothing was recorded; re-run with a longer timeoutMinutes.`,
+          );
+        }
 
         // Results is a semicolon-delimited key:value blob, one record per line,
         // not JSON — parsed defensively because the field set varies by item.
@@ -495,6 +561,7 @@ export const model = {
           status: r?.Status ?? null,
           itemCount: items.length,
           recoverableItemCount: recoverable,
+          truncated: items.length >= PREVIEW_ITEM_CAP,
           items,
         };
 
